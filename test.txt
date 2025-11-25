@@ -1,0 +1,1189 @@
+import logging; logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+import imaplib
+import smtplib
+import email
+import re
+import os
+import json
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
+from tkcalendar import DateEntry
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email import encoders
+
+# OpenAI new API
+from openai import OpenAI
+
+# =========================
+# Configuration
+# =========================
+IMAP_SERVER = "imap.gmail.com"
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+PAGE_SIZE = 100
+LARGE_BYTES = 100_000
+CREDENTIALS_FILE = "gmail_users.json"
+SETTINGS_FILE = "kmail_settings.json"
+APP_TITLE = "Kmail Manager (IMAP)"
+
+INBOX_FOLDER = "INBOX"
+SPAM_FOLDER = "[Gmail]/Spam"
+TRASH_FOLDER = "[Gmail]/Trash"
+
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+OPENAI_TEMPERATURE = 0.7
+OPENAI_TIMEOUT = 60  # seconds
+
+
+# =========================
+# Settings (OpenAI key)
+# =========================
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_settings(settings: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        print("Save settings error:", e)
+
+def resolve_openai_key():
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
+    settings = load_settings()
+    file_key = (settings.get("openai_api_key") or "").strip()
+    if file_key:
+        return file_key
+    return None
+
+def get_openai_client():
+    key = resolve_openai_key()
+    if not key:
+        return None
+    return OpenAI(api_key=key)
+
+
+# =========================
+# Credential storage
+# =========================
+def load_users():
+    if os.path.exists(CREDENTIALS_FILE):
+        try:
+            with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_users(users):
+    try:
+        with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=2)
+    except Exception as e:
+        print("Save users error:", e)
+
+def upsert_user(email_addr, app_password):
+    users = load_users()
+    now = datetime.now().isoformat(timespec="seconds")
+    for u in users:
+        if u["email"] == email_addr:
+            u["app_password"] = app_password
+            u["last_login"] = now
+            save_users(users)
+            return users
+    users.append({"email": email_addr, "app_password": app_password, "last_login": now})
+    save_users(users)
+    return users
+
+
+# =========================
+# IMAP helpers
+# =========================
+def connect_imap(email_account, app_password):
+    m = imaplib.IMAP4_SSL(IMAP_SERVER)
+    m.login(email_account, app_password)
+    return m
+
+def decode_header_value(raw):
+    if not raw:
+        return ""
+    dh = email.header.decode_header(raw)
+    parts = []
+    for text, enc in dh:
+        if isinstance(text, bytes):
+            parts.append(text.decode(enc or "utf-8", errors="ignore"))
+        else:
+            parts.append(text)
+    return " ".join(parts)
+
+def fetch_headers_batch(m, folder, batch_ids):
+    results = []
+    m.select(folder)
+    for num in batch_ids:
+        try:
+            status, msg_data = m.fetch(
+                num,
+                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO DATE)] RFC822.SIZE FLAGS)"
+            )
+            if status != "OK":
+                continue
+            subject, sender, to_addr, size, flags, date_hdr = "(no subject)", "(unknown)", "", 0, "", ""
+            for part in msg_data:
+                if not isinstance(part, tuple):
+                    continue
+                header = part[0].decode(errors="ignore")
+                content = part[1]
+                if "BODY[HEADER.FIELDS" in header:
+                    msg = email.message_from_bytes(content)
+                    subject = decode_header_value(msg.get("Subject"))
+                    sender = decode_header_value(msg.get("From"))
+                    to_addr = decode_header_value(msg.get("To"))
+                    date_hdr = decode_header_value(msg.get("Date"))
+                elif "RFC822.SIZE" in header:
+                    msize = re.search(r"RFC822\.SIZE\s+(\d+)", header)
+                    if msize:
+                        size = int(msize.group(1))
+                elif "FLAGS" in header:
+                    mflags = re.search(r"FLAGS\s+\((.*?)\)", header)
+                    flags = mflags.group(1) if mflags else ""
+            results.append({
+                "id": num.decode(),
+                "subject": subject or "(no subject)",
+                "from": sender or "(unknown)",
+                "to": to_addr or "",
+                "size": size,
+                "flags": flags,
+                "date": date_hdr
+            })
+        except Exception:
+            continue
+    return results
+
+def fetch_headers(email_account, app_password, folder, search_criteria="ALL",
+                  limit=1000, progress_cb=None, batch_size=50, stop_check=None):
+    mails = []
+    m = None
+    try:
+        m = connect_imap(email_account, app_password)
+        m.select(folder)
+        status, data = m.search(None, search_criteria)
+        if status != "OK":
+            return mails
+        ids = data[0].split()
+        ids = ids[-limit:][::-1]  # latest first
+
+        batches = [ids[i:i+batch_size] for i in range(0, len(ids), batch_size)]
+        total_batches = len(batches)
+        for idx, batch in enumerate(batches, start=1):
+            if stop_check and stop_check():
+                break
+            chunk = fetch_headers_batch(m, folder, batch)
+            mails.extend(chunk)
+            if progress_cb:
+                progress_cb(idx, total_batches)
+    except Exception as e:
+        print("Fetch headers error:", e)
+    finally:
+        try:
+            if m:
+                m.logout()
+        except Exception:
+            pass
+    try:
+        mails.sort(key=lambda x: int(x["id"]), reverse=True)
+    except Exception:
+        pass
+    return mails
+
+def fetch_body(email_account, app_password, folder, msg_id):
+    m = None
+    try:
+        m = connect_imap(email_account, app_password)
+        m.select(folder)
+        status, data = m.fetch(msg_id, "(RFC822)")
+        if status == "OK":
+            raw_email = data[0][1]
+            msg = email.message_from_bytes(raw_email)
+            return _get_text_body(msg)
+    except Exception as e:
+        print("Fetch body error:", e)
+    finally:
+        try:
+            if m:
+                m.logout()
+        except Exception:
+            pass
+    return ""
+
+def _strip_html(html):
+    html = re.sub(r"(?is)<(script|style).*?>.*?(</\1>)", "", html)
+    text = re.sub(r"(?s)<.*?>", " ", html)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def _get_text_body(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition") or "").lower()
+            if ctype == "text/plain" and "attachment" not in disp:
+                try:
+                    return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
+                except Exception:
+                    continue
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
+                return _strip_html(html)
+    else:
+        if msg.get_content_type() == "text/plain":
+            return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
+        elif msg.get_content_type() == "text/html":
+            html = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
+            return _strip_html(html)
+    return ""
+
+def delete_messages_permanently(email_account, app_password, folder, ids):
+    if not ids:
+        return False
+    m = None
+    try:
+        m = connect_imap(email_account, app_password)
+        m.select(folder)
+        for msg_id in ids:
+            m.store(msg_id, "+FLAGS", "\\Deleted")
+        m.expunge()
+        return True
+    except Exception as e:
+        print("Delete error:", e)
+        return False
+    finally:
+        try:
+            if m:
+                m.logout()
+        except Exception:
+            pass
+
+def create_folder(email_account, app_password, folder_name):
+    m = None
+    try:
+        m = connect_imap(email_account, app_password)
+        status, _ = m.create(folder_name)
+        return status == "OK"
+    except Exception as e:
+        print("Create folder error:", e)
+        return False
+    finally:
+        try:
+            if m:
+                m.logout()
+        except Exception:
+            pass
+
+def move_message(email_account, app_password, src_folder, dest_folder, msg_id):
+    m = None
+    try:
+        m = connect_imap(email_account, app_password)
+        m.select(src_folder)
+        status, _ = m.copy(msg_id, dest_folder)
+        if status != "OK":
+            return False
+        m.store(msg_id, "+FLAGS", "\\Deleted")
+        m.expunge()
+        return True
+    except Exception as e:
+        print("Move message error:", e)
+        return False
+    finally:
+        try:
+            if m:
+                m.logout()
+        except Exception:
+            pass
+
+
+# =========================
+# SMTP send
+# =========================
+def send_email_smtp(email_account, app_password, to_list, cc_list, bcc_list, subject, html_body, attachments):
+    msg = MIMEMultipart()
+    msg["From"] = email_account
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    for path in attachments:
+        try:
+            part = MIMEBase("application", "octet-stream")
+            with open(path, "rb") as f:
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            filename = os.path.basename(path)
+            part.add_header("Content-Disposition", f"attachment; filename={filename}")
+            msg.attach(part)
+        except Exception as e:
+            print("Attachment error:", e)
+
+    recipients = to_list + cc_list + bcc_list
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(email_account, app_password)
+        server.sendmail(email_account, recipients, msg.as_string())
+
+
+# =========================
+# AI via OpenAI (new API)
+# =========================
+def ai_system_prompt():
+    return (
+        "You are Mr AI, a professional assistant embedded in an email manager. "
+        "Write clear, concise, and actionable answers. Use short paragraphs or bullets. "
+        "Preserve context across turns. Avoid filler."
+    )
+
+def ai_key_ready():
+    return resolve_openai_key() is not None
+
+def ai_chat_completion(messages, model=OPENAI_DEFAULT_MODEL, temperature=OPENAI_TEMPERATURE, timeout=OPENAI_TIMEOUT):
+    """
+    Non-streaming completion via new API.
+    """
+    if not ai_key_ready():
+        return "AI is not configured. Set OPENAI_API_KEY in environment or Settings."
+    try:
+        client = get_openai_client()
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"AI error: {e}"
+
+def ai_chat_stream(messages, on_chunk, model=OPENAI_DEFAULT_MODEL, temperature=OPENAI_TEMPERATURE, timeout=OPENAI_TIMEOUT, stop_check=None):
+    """
+    Streaming completion: the new API supports stream=True on responses.
+    """
+    if not ai_key_ready():
+        on_chunk("AI is not configured. Set OPENAI_API_KEY in environment or Settings.")
+        return
+    try:
+        client = get_openai_client()
+        with client.chat.completions.stream(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        ) as stream:
+            for event in stream:
+                if stop_check and stop_check():
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    break
+                if hasattr(event, "delta") and event.delta and event.delta.get("content"):
+                    on_chunk(event.delta["content"])
+    except Exception as e:
+        on_chunk(f"\n[AI error: {e}]")
+
+
+def summarize_text(text, max_words=220):
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    if not sentences:
+        return "(No content to summarize.)"
+    picks = []
+    if sentences:
+        picks.append(sentences[0])
+    keywords = ("subject", "regarding", "deadline", "action", "request", "update", "issue", "meeting", "invoice", "payment", "offer", "summary", "conclusion", "important")
+    for s in sentences[1:]:
+        if any(k in s.lower() for k in keywords):
+            picks.append(s)
+        if len(" ".join(picks).split()) >= max_words:
+            break
+    result = " ".join(picks)
+    words = result.split()
+    if len(words) > max_words:
+        result = " ".join(words[:max_words]) + " ..."
+    return result or "(Couldn't derive a summary.)"
+
+
+# =========================
+# Tkinter App
+# =========================
+class KmailManagerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1450x1000")
+
+        # Session state
+        self.email_account = None
+        self.app_password = None
+        self.current_folder = INBOX_FOLDER
+        self.all_data = []
+        self.page_index = 0
+        self.page_size = PAGE_SIZE
+        self.checked_ids = set()
+        self.last_login_iso = None
+
+        # Compose state
+        self.compose_frame = None
+        self.compose_to = tk.StringVar()
+        self.compose_cc = tk.StringVar()
+        self.compose_bcc = tk.StringVar()
+        self.compose_subject = tk.StringVar()
+        self.attachments = []
+        self.current_font_size = 10
+
+        # Context menu
+        self.context_menu = None
+
+        # AI chat state (peer-to-peer single window)
+        self.ai_messages = [{"role": "system", "content": ai_system_prompt()}]
+        self.ai_streaming = tk.BooleanVar(value=True)
+        self.ai_model = tk.StringVar(value=OPENAI_DEFAULT_MODEL)
+        self.ai_temp = tk.DoubleVar(value=OPENAI_TEMPERATURE)
+        self.ai_stop_requested = False
+
+        # Settings state
+        self.settings_api_key = tk.StringVar(value=(resolve_openai_key() or ""))
+
+        # Stop loading flag
+        self.stop_requested = False
+
+        # Quick search toggle
+        self.quick_search = tk.BooleanVar(value=True)  # default ON for speed
+
+        self._build_login_ui()
+
+    # ---------- Login ----------
+    def _build_login_ui(self):
+        self.login_frame = ttk.Frame(self)
+        self.login_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        ttk.Label(self.login_frame, text="Login to Kmail Manager", font=("Segoe UI", 14, "bold")).pack(pady=10)
+
+        form = ttk.Frame(self.login_frame)
+        form.pack(pady=10)
+
+        ttk.Label(form, text="Email:").grid(row=0, column=0, sticky="e", padx=5, pady=5)
+        self.email_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.email_var, width=40).grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(form, text="App Password:").grid(row=1, column=0, sticky="e", padx=5, pady=5)
+        self.pass_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.pass_var, show="*", width=40).grid(row=1, column=1, padx=5, pady=5)
+
+        users_frame = ttk.Frame(self.login_frame)
+        users_frame.pack(pady=10)
+        ttk.Label(users_frame, text="Recent users:").pack(anchor="w")
+        self.users_combo = ttk.Combobox(users_frame, state="readonly", width=45)
+        self.users_combo.pack(fill=tk.X)
+        self._load_recent_users()
+        self.users_combo.bind("<<ComboboxSelected>>", self._on_recent_user_selected)
+
+        btns = ttk.Frame(self.login_frame)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="Login", command=self._login).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="Quit", command=self.destroy).pack(side=tk.LEFT, padx=5)
+
+        footer = ttk.Frame(self.login_frame)
+        footer.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(footer, text="copyright @ Krishna Bhandare").pack(side=tk.BOTTOM, pady=5)
+
+    def _load_recent_users(self):
+        users = load_users()
+        items = [f"{u['email']} (last: {u.get('last_login','')})" for u in users]
+        self.users_combo["values"] = items
+
+    def _on_recent_user_selected(self, event):
+        idx = self.users_combo.current()
+        users = load_users()
+        if 0 <= idx < len(users):
+            self.email_var.set(users[idx]["email"])
+            self.pass_var.set(users[idx]["app_password"])
+
+    def _login(self):
+        email_acc = self.email_var.get().strip()
+        app_pass = self.pass_var.get().strip()
+        if not email_acc or not app_pass:
+            messagebox.showwarning("Missing", "Enter email and app password.")
+            return
+        try:
+            m = connect_imap(email_acc, app_pass)
+            m.logout()
+        except Exception as e:
+            messagebox.showerror("Login failed", f"Cannot login via IMAP: {e}")
+            return
+
+        self.email_account = email_acc
+        self.app_password = app_pass
+        upsert_user(email_acc, app_pass)
+        self.last_login_iso = datetime.now().isoformat(timespec="seconds")
+
+        self.login_frame.destroy()
+        self._build_main_ui()
+
+    # ---------- Main UI ----------
+    def _build_main_ui(self):
+        menubar = tk.Menu(self)
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="New Email", command=self.open_compose_inline)
+        filemenu.add_separator()
+        filemenu.add_command(label="Exit", command=self.destroy)
+        menubar.add_cascade(label="File", menu=filemenu)
+
+        viewmenu = tk.Menu(menubar, tearoff=0)
+        viewmenu.add_command(label="Inbox", command=lambda: self._set_folder(INBOX_FOLDER))
+        viewmenu.add_command(label="Spam", command=lambda: self._set_folder(SPAM_FOLDER))
+        viewmenu.add_separator()
+        viewmenu.add_command(label="Large emails", command=self.filter_large_async)
+        viewmenu.add_command(label="Repetitive mails", command=self.show_duplicates_async)
+        menubar.add_cascade(label="View", menu=viewmenu)
+
+        settingsmenu = tk.Menu(menubar, tearoff=0)
+        settingsmenu.add_command(label="OpenAI settings", command=self._open_settings)
+        menubar.add_cascade(label="Settings", menu=settingsmenu)
+
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(
+            label="Contact owner of this software",
+            command=lambda: messagebox.showinfo(
+                "Help",
+                "Contact owner of this software\n\nName: Krishna Bhandare\nEmail: bhandare.krishna5@gmail.com"
+            )
+        )
+
+        menubar.add_cascade(label="Help", menu=helpmenu)
+        self.config(menu=menubar)
+
+        header = ttk.Frame(self)
+        header.pack(fill=tk.X, padx=10, pady=6)
+        self.user_label = ttk.Label(header, text=f"Logged in: {self.email_account} | Last login: {self.last_login_iso}")
+        self.user_label.pack(side=tk.LEFT)
+        ttk.Button(header, text="Logout", command=self._logout).pack(side=tk.RIGHT)
+
+        controls = ttk.Frame(self)
+        controls.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(controls, text="Load emails", command=self.load_emails_async).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls, text="Read mails", command=lambda: self.apply_filter_async("SEEN")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls, text="Unread mails", command=lambda: self.apply_filter_async("UNSEEN")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls, text="Large size emails", command=self.filter_large_async).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls, text="Repetitive mails", command=self.show_duplicates_async).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls, text="New Email", command=self.open_compose_inline).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls, text="Stop Loading", command=self._stop_loading).pack(side=tk.LEFT, padx=5)
+
+        folder_frame = ttk.Frame(self)
+        folder_frame.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(folder_frame, text="Folder:").pack(side=tk.LEFT)
+        self.folder_var = tk.StringVar(value=INBOX_FOLDER)
+        ttk.Radiobutton(folder_frame, text="Inbox", variable=self.folder_var, value=INBOX_FOLDER, command=self.on_folder_change).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(folder_frame, text="Spam", variable=self.folder_var, value=SPAM_FOLDER, command=self.on_folder_change).pack(side=tk.LEFT, padx=5)
+        ttk.Label(folder_frame, text="Create folder:").pack(side=tk.LEFT, padx=10)
+        self.new_folder_var = tk.StringVar()
+        ttk.Entry(folder_frame, textvariable=self.new_folder_var, width=25).pack(side=tk.LEFT)
+        ttk.Button(folder_frame, text="Create", command=self.create_folder_action).pack(side=tk.LEFT, padx=5)
+
+        search_frame = ttk.LabelFrame(self, text="Search (From / To / Subject / Date range)")
+        search_frame.pack(fill=tk.X, padx=8, pady=6)
+        self.search_from = tk.StringVar()
+        self.search_to = tk.StringVar()
+        self.search_subject = tk.StringVar()
+        self.date_from = tk.StringVar()
+        self.date_to = tk.StringVar()
+        ttk.Label(search_frame, text="From:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Entry(search_frame, textvariable=self.search_from, width=20).grid(row=0, column=1, padx=4, pady=4)
+        ttk.Label(search_frame, text="To:").grid(row=0, column=2, sticky="e", padx=4, pady=4)
+        ttk.Entry(search_frame, textvariable=self.search_to, width=20).grid(row=0, column=3, padx=4, pady=4)
+        ttk.Label(search_frame, text="Subject:").grid(row=0, column=4, sticky="e", padx=4, pady=4)
+        ttk.Entry(search_frame, textvariable=self.search_subject, width=30).grid(row=0, column=5, padx=4, pady=4)
+        ttk.Label(search_frame, text="Date from:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.date_from_entry = DateEntry(search_frame, textvariable=self.date_from, date_pattern="y-mm-dd", width=18)
+        self.date_from_entry.grid(row=1, column=1, padx=4, pady=4)
+        ttk.Label(search_frame, text="Date to:").grid(row=1, column=2, sticky="e", padx=4, pady=4)
+        self.date_to_entry = DateEntry(search_frame, textvariable=self.date_to, date_pattern="y-mm-dd", width=18)
+        self.date_to_entry.grid(row=1, column=3, padx=4, pady=4)
+        ttk.Checkbutton(search_frame, text="Quick search (limit 100)", variable=self.quick_search).grid(row=1, column=4, padx=8, pady=4)
+        ttk.Button(search_frame, text="Search", command=self.search_async).grid(row=1, column=5, padx=8, pady=4)
+
+        split = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        split.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        left_frame = ttk.Frame(split)
+        # Streamlined columns: remove ID and Flags
+        self.tree = ttk.Treeview(
+            left_frame,
+            columns=("select", "from", "subject", "date", "size", "to"),
+            show="headings",
+            height=20
+        )
+        self.tree.heading("select", text="Select")
+        self.tree.column("select", width=70, anchor=tk.CENTER)
+        self.tree.heading("from", text="From"); self.tree.column("from", width=280, anchor=tk.W)
+        self.tree.heading("subject", text="Subject"); self.tree.column("subject", width=520, anchor=tk.W)
+        self.tree.heading("date", text="Date"); self.tree.column("date", width=200, anchor=tk.W)
+        self.tree.heading("size", text="Size"); self.tree.column("size", width=140, anchor=tk.E)
+        self.tree.heading("to", text="To"); self.tree.column("to", width=260, anchor=tk.W)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb = ttk.Scrollbar(left_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(left_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<<TreeviewSelect>>", self.show_selected_details)
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Ask AI for Summary", command=self._summarize_selected_email)
+        self.tree.bind("<Button-3>", self._on_right_click)
+        split.add(left_frame, weight=1)
+
+        right_frame = ttk.Frame(split)
+        ttk.Label(right_frame, text="Details").pack(anchor="w")
+        self.details_text = tk.Text(right_frame, wrap="word", height=20)
+        self.details_text.pack(fill=tk.BOTH, expand=True)
+        d_vsb = ttk.Scrollbar(right_frame, orient="vertical", command=self.details_text.yview)
+        self.details_text.configure(yscrollcommand=d_vsb.set)
+        d_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        split.add(right_frame, weight=2)
+
+        # Draggable, friendly chat window (peer-to-peer single window)
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill=tk.X, padx=8, pady=6)
+        self.prev_btn = ttk.Button(bottom, text="Prev", command=lambda: self._page_move(False))
+        self.prev_btn.pack(side=tk.LEFT, padx=5)
+        self.next_btn = ttk.Button(bottom, text="Next", command=lambda: self._page_move(True))
+        self.next_btn.pack(side=tk.LEFT, padx=5)
+        self.select_all_btn = ttk.Button(bottom, text="Select all (page)", command=self.select_all_page)
+        self.select_all_btn.pack(side=tk.LEFT, padx=5)
+        self.delete_selected_btn = ttk.Button(bottom, text="Delete selected", command=self.delete_selected_async)
+        self.delete_selected_btn.pack(side=tk.LEFT, padx=5)
+        self.status_label = ttk.Label(bottom, text="Ready")
+        self.status_label.pack(side=tk.RIGHT, padx=5)
+        self.progress_bar = ttk.Progressbar(bottom, orient="horizontal", mode="determinate", length=320)
+        self.progress_bar.pack(side=tk.RIGHT, padx=10)
+
+        # ---------- Embedded Mr AI Chat Panel ----------
+        chat_frame = ttk.LabelFrame(self, text="Ask Mr AI")
+        chat_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
+
+        ctrl = ttk.Frame(chat_frame)
+        ctrl.pack(fill=tk.X, padx=4, pady=4)
+        ttk.Checkbutton(ctrl, text="Stream", variable=self.ai_streaming).pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="Model:").pack(side=tk.LEFT, padx=6)
+        ttk.Combobox(ctrl, state="readonly", width=12, textvariable=self.ai_model,
+                     values=("gpt-4o-mini", "gpt-4o")).pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="Temp:").pack(side=tk.LEFT, padx=6)
+        ttk.Spinbox(ctrl, from_=0.0, to=1.0, increment=0.1, textvariable=self.ai_temp, width=5).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Stop", command=self._stop_ai).pack(side=tk.RIGHT, padx=6)
+
+        self.chat_out = tk.Text(chat_frame, wrap="word", height=16)
+        self.chat_out.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        scroll = ttk.Scrollbar(chat_frame, orient="vertical", command=self.chat_out.yview)
+        self.chat_out.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        entry_frame = ttk.Frame(chat_frame)
+        entry_frame.pack(fill=tk.X, padx=4, pady=4)
+        self.chat_entry = ttk.Entry(entry_frame)
+        self.chat_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(entry_frame, text="Send", command=self._chat_send).pack(side=tk.RIGHT, padx=4)
+
+
+        footer = ttk.Frame(self)
+        footer.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(footer, text="copyright @ Krishna Bhandare").pack(side=tk.BOTTOM, pady=5)
+
+        # Compose (hidden initially)
+        self._build_compose_frame()
+
+
+    # ---------- Draggable Chat Window ----------
+
+    # -----------/Draggable chat window -------
+
+
+    def _stop_ai(self):
+        self.ai_stop_requested = True
+        if hasattr(self, "status_label"):
+            self.status_label.config(text="AI stopped by user.")
+
+    def _chat_send(self):
+        query = self.chat_entry.get().strip()
+        if not query:
+            return
+
+        self.ai_stop_requested = False
+        model = self.ai_model.get() or OPENAI_DEFAULT_MODEL
+        temp = float(self.ai_temp.get())
+        ts = datetime.now().strftime("%H:%M")
+
+        # Echo user message
+        self.chat_out.insert(tk.END, f"\n👤 {ts} — You:\n{query}\n")
+        self.chat_out.see(tk.END)
+        if hasattr(self, "status_label"):
+            self.status_label.config(text="Mr AI is thinking...")
+
+        def on_finish(answer_text):
+            # Persist dialogue for multi-turn
+            self.ai_messages.append({"role": "user", "content": query})
+            self.ai_messages.append({"role": "assistant", "content": answer_text})
+            if hasattr(self, "status_label"):
+                self.status_label.config(text="Ready")
+
+        def task_stream():
+            messages = list(self.ai_messages) + [{"role": "user", "content": query}]
+            collected = []
+            def push_chunk(txt):
+                collected.append(txt)
+                self.after(0, lambda t=txt: (self.chat_out.insert(tk.END, t), self.chat_out.see(tk.END)))
+            self.after(0, lambda: self.chat_out.insert(tk.END, f"\n🧠 {ts} — Mr AI:\n"))
+            ai_chat_stream(
+                messages,
+                on_chunk=push_chunk,
+                model=model,
+                temperature=temp,
+                stop_check=lambda: self.ai_stop_requested
+            )
+            answer = "".join(collected).strip()
+            self.after(0, lambda: on_finish(answer if answer else "(No response)"))
+
+        def task_nonstream():
+            messages = list(self.ai_messages) + [{"role": "user", "content": query}]
+            answer = ai_chat_completion(messages, model=model, temperature=temp)
+            if not answer:
+                answer = "No response from AI."
+            self.after(0, lambda: (self.chat_out.insert(tk.END, f"\n🧠 {ts} — Mr AI:\n{answer}\n"), self.chat_out.see(tk.END)))
+            self.after(0, lambda: on_finish(answer))
+
+        threading.Thread(target=(task_stream if self.ai_streaming.get() else task_nonstream), daemon=True).start()
+        self.chat_entry.delete(0, tk.END)
+
+    # ---------- Settings UI ----------
+    def _open_settings(self):
+        win = tk.Toplevel(self)
+        win.title("OpenAI Settings")
+        win.geometry("520x200")
+        ttk.Label(win, text="OpenAI API key").pack(anchor="w", padx=10, pady=6)
+        entry = ttk.Entry(win, textvariable=self.settings_api_key, width=62)
+        entry.pack(fill=tk.X, padx=10)
+        hint = ttk.Label(win, text="If set, the app will use this key. Otherwise, it uses OPENAI_API_KEY from environment.", foreground="#555")
+        hint.pack(anchor="w", padx=10, pady=6)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=10)
+        def save_and_apply():
+            key = self.settings_api_key.get().strip()
+            settings = load_settings()
+            settings["openai_api_key"] = key
+            save_settings(settings)
+            messagebox.showinfo("Settings", "API key saved.")
+            win.destroy()
+        ttk.Button(btns, text="Save", command=save_and_apply).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=6)
+
+    # ---------- Compose ----------
+    def _build_compose_frame(self):
+        self.compose_frame = ttk.LabelFrame(self, text="Compose Email")
+        ttk.Label(self.compose_frame, text="To:").grid(row=0, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(self.compose_frame, textvariable=self.compose_to, width=80).grid(row=0, column=1, padx=5, pady=3)
+        ttk.Label(self.compose_frame, text="CC:").grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(self.compose_frame, textvariable=self.compose_cc, width=80).grid(row=1, column=1, padx=5, pady=3)
+        ttk.Label(self.compose_frame, text="BCC:").grid(row=2, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(self.compose_frame, textvariable=self.compose_bcc, width=80).grid(row=2, column=1, padx=5, pady=3)
+        ttk.Label(self.compose_frame, text="Subject:").grid(row=3, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(self.compose_frame, textvariable=self.compose_subject, width=80).grid(row=3, column=1, padx=5, pady=3)
+
+        self.compose_body = tk.Text(self.compose_frame, wrap="word", height=10)
+        self.compose_body.grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        bv = ttk.Scrollbar(self.compose_frame, orient="vertical", command=self.compose_body.yview)
+        self.compose_body.configure(yscrollcommand=bv.set)
+        bv.grid(row=4, column=2, sticky="ns", padx=2)
+        self.compose_frame.rowconfigure(4, weight=1)
+        self.compose_frame.columnconfigure(1, weight=1)
+
+        attach_frame = ttk.Frame(self.compose_frame)
+        attach_frame.grid(row=5, column=0, columnspan=2, sticky="we", padx=5, pady=4)
+        ttk.Button(attach_frame, text="Add attachment", command=self._add_attachment).pack(side=tk.LEFT)
+        self.attach_list = tk.Listbox(attach_frame, height=4)
+        self.attach_list.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Button(attach_frame, text="Remove selected", command=self._remove_attachment).pack(side=tk.LEFT)
+
+        actions = ttk.Frame(self.compose_frame)
+        actions.grid(row=6, column=0, columnspan=2, sticky="e", padx=5, pady=8)
+        ttk.Button(actions, text="Send", command=self._send_composed_email).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(actions, text="Close", command=self.close_compose_inline).pack(side=tk.RIGHT, padx=5)
+
+        self.compose_frame.pack_forget()
+
+    def open_compose_inline(self):
+        self.compose_to.set("")
+        self.compose_cc.set("")
+        self.compose_bcc.set("")
+        self.compose_subject.set("")
+        self.compose_body.delete("1.0", tk.END)
+        self.attachments.clear()
+        self.attach_list.delete(0, tk.END)
+        self.compose_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+
+    def close_compose_inline(self):
+        self.compose_frame.pack_forget()
+
+    def _add_attachment(self):
+        paths = filedialog.askopenfilenames(title="Select files")
+        for p in paths:
+            if p not in self.attachments:
+                self.attachments.append(p)
+                self.attach_list.insert(tk.END, os.path.basename(p))
+
+    def _remove_attachment(self):
+        sel = self.attach_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        fn = self.attach_list.get(idx)
+        for i, p in enumerate(self.attachments):
+            if os.path.basename(p) == fn:
+                self.attachments.pop(i)
+                break
+        self.attach_list.delete(idx)
+
+    def _send_composed_email(self):
+        to = [e.strip() for e in self.compose_to.get().split(",") if e.strip()]
+        cc = [e.strip() for e in self.compose_cc.get().split(",") if e.strip()]
+        bcc = [e.strip() for e in self.compose_bcc.get().split(",") if e.strip()]
+        subject = self.compose_subject.get().strip()
+        raw = self.compose_body.get("1.0", tk.END).strip()
+        html_body = "<html><body>" + "<br/>".join(raw.splitlines()) + "</body></html>"
+        if not to or not subject:
+            messagebox.showwarning("Missing", "Please provide at least 'To' and 'Subject'.")
+            return
+        try:
+            send_email_smtp(self.email_account, self.app_password, to, cc, bcc, subject, html_body, self.attachments)
+            messagebox.showinfo("Sent", "Email sent successfully.")
+            self.close_compose_inline()
+        except Exception as e:
+            messagebox.showerror("Send failed", f"Error sending email:\n{e}")
+
+    # ---------- Folder / logout ----------
+    def _logout(self):
+        self.email_account = None
+        self.app_password = None
+        for child in self.winfo_children():
+            child.destroy()
+        self._build_login_ui()
+
+    def _set_folder(self, folder):
+        self.folder_var.set(folder)
+        self.on_folder_change()
+
+    def on_folder_change(self):
+        self.current_folder = self.folder_var.get()
+        if hasattr(self, "status_label"):
+            self.status_label.config(text=f"Folder set: {self.current_folder}")
+
+    # ---------- Search / rules ----------
+    def _imap_date(self, ymd):
+        try:
+            return datetime.strptime(ymd, "%Y-%m-%d").strftime("%d-%b-%Y")
+        except Exception:
+            return ""
+
+    def build_search_criteria(self):
+        criteria = []
+        if self.search_from.get().strip():
+            criteria.append(f'FROM "{self.search_from.get().strip()}"')
+        if self.search_to.get().strip():
+            criteria.append(f'TO "{self.search_to.get().strip()}"')
+        if self.search_subject.get().strip():
+            criteria.append(f'SUBJECT "{self.search_subject.get().strip()}"')
+        if self.date_from.get().strip():
+            imap_since = self._imap_date(self.date_from.get().strip())
+            if imap_since:
+                criteria.append(f"SINCE {imap_since}")
+        if self.date_to.get().strip():
+            imap_before = self._imap_date(self.date_to.get().strip())
+            if imap_before:
+                criteria.append(f"BEFORE {imap_before}")
+        return "ALL" if not criteria else " ".join(criteria)
+
+    def search_async(self):
+        criteria = self.build_search_criteria()
+        small = ("SINCE" in criteria) or ("BEFORE" in criteria) or self.quick_search.get()
+        limit = 100 if small else 1000
+        self._run_background(lambda: self._load_headers(criteria, limit))
+
+    def create_folder_action(self):
+        name = self.new_folder_var.get().strip()
+        if not name:
+            messagebox.showwarning("Create folder", "Enter a folder name.")
+            return
+        ok = create_folder(self.email_account, self.app_password, name)
+        if ok:
+            messagebox.showinfo("Create folder", f"Folder '{name}' created.")
+        else:
+            messagebox.showerror("Create folder", f"Could not create folder '{name}'.")
+
+    # ---------- Duplicates / filters ----------
+    def show_duplicates_async(self):
+        def task():
+            data = fetch_headers(
+                self.email_account, self.app_password, self.current_folder,
+                "ALL", limit=1000,
+                progress_cb=lambda d,t: self.after(0, lambda: self._update_progress(d,t)),
+                batch_size=50,
+                stop_check=lambda: self.stop_requested
+            )
+            groups = {}
+            for m in data:
+                key = (m["from"].lower().strip(), m["subject"].lower().strip())
+                groups.setdefault(key, []).append(m)
+            duplicates = []
+            for items in groups.values():
+                if len(items) > 1:
+                    duplicates.extend(items)
+            self._apply_dataset(duplicates)
+            self.after(0, lambda: self.status_label.config(text=f"Repetitive mails: {len(duplicates)}"))
+        self._run_background(task)
+
+    def load_emails_async(self):
+        self._run_background(lambda: self._load_headers("ALL", 1000))
+
+    def apply_filter_async(self, criteria):
+        self._run_background(lambda: self._load_headers(criteria, 500))
+
+    def filter_large_async(self):
+        def task():
+            data = fetch_headers(
+                self.email_account, self.app_password, self.current_folder,
+                "ALL", limit=1000,
+                progress_cb=lambda d,t: self.after(0, lambda: self._update_progress(d,t)),
+                batch_size=50,
+                stop_check=lambda: self.stop_requested
+            )
+            filtered = [m for m in data if m.get("size", 0) >= LARGE_BYTES]
+            self._apply_dataset(filtered)
+            self.after(0, lambda: self.status_label.config(text=f"Large emails: {len(filtered)}"))
+        self._run_background(task)
+
+    def _load_headers(self, search_criteria, limit=1000):
+        def progress_cb(done_batches, total_batches):
+            self.after(0, lambda: self._update_progress(done_batches, total_batches))
+        data = fetch_headers(
+            self.email_account, self.app_password, self.current_folder,
+            search_criteria, limit=limit,
+            progress_cb=progress_cb, batch_size=50,
+            stop_check=lambda: self.stop_requested
+        )
+        self._apply_dataset(data)
+        self.after(0, lambda: self.status_label.config(text=f"Loaded {len(data)} emails"))
+
+    def _apply_dataset(self, data):
+        def apply():
+            self.all_data = data
+            self.page_index = 0
+            self.checked_ids.clear()
+            self._render_page()
+            self.progress_bar["value"] = 0
+        self.after(0, apply)
+
+    def _render_page(self):
+        start = self.page_index * self.page_size
+        end = start + self.page_size
+        page = self.all_data[start:end]
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for m in page:
+            checked = "☐" if m.get("checked") is not True else "☑"
+            # Render without ID/Flags columns
+            self.tree.insert("", tk.END, values=(checked, m["from"], m["subject"], m["date"], m["size"], m["to"]))
+        self.prev_btn.config(state=tk.NORMAL if self.page_index > 0 else tk.DISABLED)
+        max_pages = (len(self.all_data) - 1) // self.page_size if self.all_data else 0
+        self.next_btn.config(state=tk.NORMAL if self.page_index < max_pages else tk.DISABLED)
+
+    def _page_move(self, forward=True):
+        max_pages = (len(self.all_data) - 1) // self.page_size if self.all_data else 0
+        if forward:
+            if self.page_index < max_pages:
+                self.page_index += 1
+                self._render_page()
+        else:
+            if self.page_index > 0:
+                self.page_index -= 1
+                self._render_page()
+
+    def select_all_page(self):
+        for row in self.tree.get_children():
+            vals = list(self.tree.item(row, "values"))
+            vals[0] = "☑"
+            self.tree.item(row, values=vals)
+        # track checks against underlying data
+        start = self.page_index * self.page_size
+        end = start + self.page_size
+        for m in self.all_data[start:end]:
+            m["checked"] = True
+
+    # ---------- Tree / details ----------
+    def _on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        if col != "#1":
+            return
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        vals = list(self.tree.item(row_id, "values"))
+        toggled = (vals[0] == "☐")
+        vals[0] = "☑" if toggled else "☐"
+        self.tree.item(row_id, values=vals)
+        # sync to data
+        idx = self.tree.index(row_id)
+        start = self.page_index * self.page_size
+        if 0 <= idx < len(self.all_data[start:start+self.page_size]):
+            self.all_data[start + idx]["checked"] = (vals[0] == "☑")
+
+    def show_selected_details(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        row_id = sel[0]
+        vals = self.tree.item(row_id, "values")
+        # Find matching mail by row index
+        idx = self.tree.index(row_id)
+        start = self.page_index * self.page_size
+        if 0 <= idx < len(self.all_data[start:start+self.page_size]):
+            m = self.all_data[start + idx]
+        else:
+            return
+        msg_id = m["id"]
+        body = fetch_body(self.email_account, self.app_password, self.current_folder, msg_id)
+        self.details_text.delete("1.0", tk.END)
+        self.details_text.insert(tk.END, f"Subject: {m['subject']}\nFrom: {m['from']}\nTo: {m['to']}\nSize: {m['size']} bytes | Date: {m['date']}\n\n")
+        self.details_text.insert(tk.END, body or "(no body)")
+
+    # ---------- Right-click summary ----------
+    def _on_right_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def _summarize_selected_email(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        row_id = sel[0]
+        idx = self.tree.index(row_id)
+        start = self.page_index * self.page_size
+        if 0 <= idx < len(self.all_data[start:start+self.page_size]):
+            m = self.all_data[start + idx]
+        else:
+            return
+        msg_id = m["id"]
+        body = fetch_body(self.email_account, self.app_password, self.current_folder, msg_id)
+        if not body.strip():
+            messagebox.showinfo("AI Summary", "No body text to summarize.")
+            return
+        base = summarize_text(body, max_words=220)
+        messages = [
+            {"role": "system", "content": ai_system_prompt()},
+            {"role": "user", "content": f"Refine this email summary professionally. Provide key points, context, and clear next actions.\n\n{base}"}
+        ]
+        refined = ai_chat_completion(messages, model=self.ai_model.get(), temperature=float(self.ai_temp.get()))
+        messagebox.showinfo("AI Summary", refined)
+
+    # ---------- Progress / Stop ----------
+    def _update_progress(self, current, total):
+        if hasattr(self, "progress_bar"):
+            self.progress_bar["maximum"] = max(1, total)
+            self.progress_bar["value"] = current
+            self.progress_bar.update_idletasks()
+        if hasattr(self, "status_label"):
+            self.status_label.config(text=f"Loading batch {current}/{total}")
+
+    def _stop_loading(self):
+        self.stop_requested = True
+        if hasattr(self, "status_label"):
+            self.status_label.config(text="Loading stopped by user.")
+        if hasattr(self, "progress_bar"):
+            self.progress_bar["value"] = 0
+
+    # ---------- Background ----------
+    def _run_background(self, task):
+        self.stop_requested = False
+        if hasattr(self, "status_label"):
+            self.status_label.config(text="Working...")
+        self._set_controls_state(tk.DISABLED)
+        def worker():
+            try:
+                task()
+            except Exception as e:
+                print("Background error:", e)
+                if hasattr(self, "status_label"):
+                    self.after(0, lambda: self.status_label.config(text="Error"))
+            finally:
+                self.stop_requested = False
+                self.after(0, lambda: self._set_controls_state(tk.NORMAL))
+                if hasattr(self, "status_label"):
+                    self.after(0, lambda: self.status_label.config(text="Ready"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_controls_state(self, state):
+        for attr in ("prev_btn", "next_btn", "select_all_btn", "delete_selected_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).config(state=state)
+        button_texts = {
+            "Load emails", "Read mails", "Unread mails",
+            "Large size emails", "Repetitive mails", "New Email", "Stop Loading"
+        }
+        for parent in self.winfo_children():
+            for child in parent.winfo_children():
+                for w in child.winfo_children():
+                    if isinstance(w, ttk.Button):
+                        txt = w.cget("text")
+                        if txt in button_texts:
+                            w.config(state=state)
+
+    # ---------- Delete selected ----------
+    def delete_selected_async(self):
+        ids = [m["id"] for m in self.all_data if m.get("checked")]
+        if not ids:
+            messagebox.showinfo("Delete", "No emails selected.")
+            return
+        confirm = messagebox.askyesno("Delete", f"Delete {len(ids)} selected emails permanently?")
+        if not confirm:
+            return
+        def task():
+            ok = delete_messages_permanently(self.email_account, self.app_password, self.current_folder, ids)
+            self.after(0, lambda: messagebox.showinfo("Delete", f"Deleted {len(ids)} emails." if ok else "Delete failed."))
+            self.after(0, self.load_emails_async)
+        self._run_background(task)
+
+
+# =========================
+# Run
+# =========================
+if __name__ == "__main__":
+    print("OpenAI key ready:", "Yes" if ai_key_ready() else "No")
+    app = KmailManagerApp()
+    app.mainloop()
